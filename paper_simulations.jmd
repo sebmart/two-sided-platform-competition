@@ -1,0 +1,917 @@
+# Set up the environment
+- This first piece of code needs to be run once, it downloads the packages if needed and sets up the environment.
+- adjust the number of cores and the number of seeds as needed.
+
+
+
+```julia
+N_PROCESSORS = 8
+
+using Pkg
+Pkg.activate("./freeriding_simulations")
+Pkg.instantiate()
+using Plots, Accessors, JLD2, Statistics, PGFPlotsX, Distributed
+pgfplotsx()
+# addprocs(N_PROCESSORS)
+@everywhere include("simulation_utils_logit.jl")
+@everywhere  using .FreeridingSimulation, ProgressMeter, DataFrames
+
+
+parameters_to_simulate = Set{Tuple{ProblemParameters, Bool}}()
+function to_simulate!(p::ProblemParameters; sequential::Bool=true)
+    push!(parameters_to_simulate, (p, sequential))
+end
+
+
+function run_simulations(n_seeds::Int; randomness=0.1, filename::String, save_every::Int=n_seeds, max_simulations::Int=500_000)
+    
+    # Define a long-running task function with timeout warning
+    function simulation_task(p, sequential, seed, randomness, max_simulations)        
+        
+        result = try
+            firms, workers, demand = initial_guess(p, seed, randomness=randomness)
+            if sequential
+                firms, workers, demand, sim, iters = sequentialNE(p, firms, workers, demand, max_iter=1000, max_simulations=max_simulations)
+            else
+                firms, workers, demand, sim, iters = simultaneousNE(p, firms, workers, demand, max_iter=1000, max_simulations=max_simulations)
+            end
+            DataFrame(seed = seed, sequential = sequential, params = p, firms = firms, workers = workers, demand = demand, iters = iters, converged = true)
+        catch e
+            @error "Error: Simulation failed" p seed sequential
+            
+            firms, workers, demand = initial_guess(p, seed, randomness=randomness)
+            DataFrame(seed = seed, sequential = sequential, params = p, firms = firms, workers = workers, demand = demand, iters = -1, converged = false)
+        end
+        
+        return result
+    end
+    
+    seed_batches = Iterators.partition(1:n_seeds, save_every)
+    data = DataFrame(seed = Int[], sequential = Bool[], params = ProblemParameters[], firms = FirmDecisions[], workers = WorkerDecisions[], demand = DemandDecisions[], iters = Int[], converged = Bool[])
+
+    for batch in seed_batches
+        @info "Starting batch $(batch)..."
+        batch_data = @showprogress pmap(collect(Iterators.product(parameters_to_simulate, batch))) do ((p, sequential), seed)
+            simulation_task(p, sequential, seed, randomness, max_simulations)
+        end
+        batch_df = vcat(batch_data...)
+        append!(data, batch_df)
+        @info "Saving progress after seed $(maximum(batch))..."
+        save_object(filename, data)
+    end
+end
+
+
+function get_results(results::DataFrame, p::ProblemParameters; sequential=true)
+    relevant_results = results[results.params .== p .&& results.sequential .== sequential, :]
+    pay1 = Float64[]
+    pay2 = Float64[]
+    profit1 = Float64[]
+    profit2 = Float64[]
+    for r in eachrow(relevant_results)
+        sim = simulation(r.params,r.firms, r.workers, r.demand)
+        metrics = result_metrics(r.params, r.firms, r.workers, r.demand, sim)
+        push!(profit1, metrics["Firm Profit 1"])
+        push!(profit2, metrics["Firm Profit 2"])
+        if profit1[end] > 0.0
+            push!(pay1, metrics["Firm Pay 1"])
+        end
+        if profit2[end] > 0.0
+            push!(pay2, metrics["Firm Pay 2"])
+        end
+    end
+    return (
+        avg_pay1 = length(pay1) > 0 ? mean(pay1) : NaN,
+        avg_pay2 = length(pay2) > 0 ? mean(pay2) : NaN,
+        avg_profit1 =  mean(profit1),
+        avg_profit2 = mean(profit2),
+        max_pay1 = length(pay1) > 0 ? quantile(pay1, 0.75) : NaN,
+        max_pay2 = length(pay2) > 0 ? quantile(pay2, 0.75) : NaN,
+        max_profit1 = quantile(profit1, 0.75),
+        max_profit2 = quantile(profit2, 0.75),
+        min_pay1 = length(pay1) > 0 ? quantile(pay1, 0.25) : NaN,
+        min_pay2 = length(pay2) > 0 ? quantile(pay2, 0.25) : NaN,
+        min_profit1 = quantile(profit1, 0.25),
+        min_profit2 = quantile(profit2, 0.25)
+    )
+end
+
+base_p = ProblemParameters(
+    # Firm parameters
+    time1 = 1.0, # the time it takes a worker to complete a task for firm 1
+    time2 = 1.0, # the time it takes a worker to complete a task for firm 2
+    # the two times are set to be the same time - it does not seem too interesting to study the impact of different times
+    
+    # Demand parameters
+    firm1_demand = 2.,  # Maximum demand rate dedicated firm 1
+    firm2_demand = 2.,  # Maximum demand rate dedicated firm 2
+    firm12_demand = 0., # Maximum demand rate shared between firm 1 and firm 2 (i.e., price competition matters)
+    service_value = 100.0, # value of service for the customer if they are served, in dollars
+    no_service_cost = 0.0, # customers who are not served get this utility loss. 0 is fine because there is already an upside to being served (utility = service_value - price)
+    demand_sensitivity = 0.2, # demand elasticity in the logit model. This value gives the nice demand curve we share in the paper.
+    
+    # Worker parameters
+    firm1_supply = 0.0, # Maximum supply rate dedicated firm 1 - by default, all supply is shared between the two firms as in the paper
+    firm2_supply = 0.0, # Maximum supply rate dedicated firm 2 - by default, all supply is shared between the two firms as in the paper
+    firm12_supply = 4.0, # Maximum supply rate shared between firm 1 and firm 2 (note that these workers can still choose to be dedicated if it's better for them)
+    supply_reservation_wage = 40.0, # reservation wage for workers - this will be the equilibrium wage if the elasticity is high and there is enough supply (as in the paper)
+    supply_sensitivity = 5.0, # sensitivity of supply to wage differential. This value is very high and close to the paper's model.
+
+
+    # Simulation parameters
+    rate_step = 0.02, # step size for the rate of arrival of customers and supply
+    price_step = 1.0, # step size for the price of service and the worker pay
+    max_queue = 5 # maximum queue length for the simulation. This value is chosen such that the probability that at least one queue is full is < 2% in all simulations. We choose the smallest value that satisfies this condition, as it greatly speeds up the simulation while being a good approximation of infinite queues. Note that, to find an equilibrium, we typically need to solve a thousand systems of linear equations of size (max_queue+1)^3.
+);
+```
+
+# Run the simulations
+
+- Vanilla setting & order of events
+```julia
+p = base_p
+firm1_sizes = (0.0:0.2:4.0)[2:end-1]
+sequential = [true, false]
+for firm1_size in firm1_sizes, sequential in sequential
+    p = @set p.firm1_demand = firm1_size
+    p = @set p.firm2_demand = 4.0 - firm1_size
+    to_simulate!(p, sequential=sequential)
+end
+```
+- Impact of competition
+
+```julia
+p = base_p
+total_demand = 4.0
+fractions_dedicated = 0.0:0.1:1.0
+fractions_dedicated_firm1 = [0.0, 0.25, 0.5]
+params = ProblemParameters[]
+for fraction_dedicated in fractions_dedicated, fraction_dedicated_firm1 in fractions_dedicated_firm1
+    p = @set p.firm1_demand = total_demand * fraction_dedicated * fraction_dedicated_firm1
+    p = @set p.firm2_demand = total_demand * fraction_dedicated * (1 - fraction_dedicated_firm1)
+    p = @set p.firm12_demand = total_demand * (1 - fraction_dedicated)
+    to_simulate!(p)
+end
+```
+
+- impact of quality
+
+```julia
+p = base_p
+total_demand = 4.0
+no_service_costs = 0.0:1.0:10.0
+firm1_demand_ratios = [1/4, 1/2]
+competitions = [true, false]
+
+for no_service_cost in no_service_costs, firm1_demand_ratio in firm1_demand_ratios, competition in competitions
+    p = @set p.no_service_cost = no_service_cost
+    if competition
+        p = @set p.firm1_demand = 0.0
+        p = @set p.firm2_demand = 0.0
+        p = @set p.firm12_demand = total_demand
+    else
+        p = @set p.firm1_demand = total_demand * firm1_demand_ratio
+        p = @set p.firm2_demand = total_demand * (1 - firm1_demand_ratio)
+        p = @set p.firm12_demand = 0.0
+    end
+    to_simulate!(p)
+end
+```
+
+- Impact of supply sensitivity
+```julia
+p = base_p
+supply_sensitivities = 10 .^ range(-1, 1, length=11)
+total_demand = 4.0
+firm_demand_ratios = [1/4, 1/2]
+params = ProblemParameters[]
+for supply_sensitivity in supply_sensitivities, firm_demand_ratio in firm_demand_ratios
+    p = @set p.supply_sensitivity = supply_sensitivity
+    p = @set p.firm1_demand = total_demand * firm_demand_ratio
+    p = @set p.firm2_demand = total_demand * (1 - firm_demand_ratio)
+    to_simulate!(p)
+end
+```
+
+- Impact of private labor pools
+```julia
+p = base_p
+total_supply = 4.0
+fractions_dedicated = 0.0:0.1:1.0
+fractions_dedicated_firm1 = [0.0, 0.25, 0.5]
+params = ProblemParameters[]
+for fraction_dedicated in fractions_dedicated, fraction_dedicated_firm1 in fractions_dedicated_firm1
+    p = @set p.firm1_supply = total_supply * fraction_dedicated * fraction_dedicated_firm1
+    p = @set p.firm2_supply = total_supply * fraction_dedicated * (1 - fraction_dedicated_firm1)
+    p = @set p.firm12_supply = total_supply * (1 - fraction_dedicated)
+    to_simulate!(p)
+end
+```
+
+- run the simulations (! high computation time  )
+
+```julia
+N_SEEDS = 32
+println("Need to run $(length(parameters_to_simulate)*N_SEEDS) simulations")
+data = run_simulations(N_SEEDS, filename="results_cap5_32seeds.jld2", randomness=0.1, save_every=2, max_simulations=500_000)
+```
+
+# Visualizations
+
+## Vanilla setting & order of events
+We vary the firm's relative sizes in a vanilla setting to show that results are consistent with the paper. We also show the impact of the order of events.
+
+```julia
+data = load_object("results_cap5_32seeds.jld2")
+# First find the global min/max for profits and pay to ensure consistent y-axes
+profit_max = -Inf
+pay_max = -Inf
+
+p = base_p
+firm1_sizes_full = (0.0:0.2:4.0)[2:end-1]
+firm1_sizes = firm1_sizes_full[1:ceil(Int, length(firm1_sizes_full)/2)] # make it symmetric
+for firm1_size in firm1_sizes, sequential in [true, false]
+    p = @set p.firm1_demand = firm1_size
+    p = @set p.firm2_demand = 4.0 - firm1_size
+    results = get_results(data, p, sequential=sequential)
+    profit_max = max(profit_max, results.max_profit1, results.max_profit2)
+    pay_max = max(pay_max, isnan(results.max_pay1) ? -Inf : results.max_pay1, isnan(results.max_pay2) ? -Inf : results.max_pay2)
+end
+
+@show profit_max, pay_max
+
+# Add some padding to the ranges (only adjust the maximum)
+profit_range = [0.0, 1.05*profit_max]
+pay_range = [0.0, 1.05*pay_max]
+
+# Make the plot symmetric
+
+# Create the plots
+plots = []
+
+# Set default font sizes
+default_font = 18  # Increased from default
+title_font = 18    # Increased from default
+
+# Convert firm sizes to percentages
+firm1_percentages = 100 * firm1_sizes_full / 4.0  # Convert to percentages
+
+# First create both profit plots
+for (idx, sequential) in enumerate([true, false])
+    profit_plot = plot(
+        title=sequential ? "Sequential Equilibrium" : "Simultaneous Equilibrium",
+        ylabel=(sequential ? "Profit (\$/hr)" : ""),
+        xlabel="",
+        legend=(sequential ? :top : false),
+        ylims=profit_range,
+        xlims=(0, 100),  # Set x-axis from 0% to 100%
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+        # Collect and plot profit data
+    results = []
+    for firm1_size in firm1_sizes
+        p = @set p.firm1_demand = firm1_size
+        p = @set p.firm2_demand = 4.0 - firm1_size
+        push!(results, get_results(data, p, sequential=sequential))
+    end
+    # add the results to the plot in reverse order to make it symmetric
+    results = [results; reverse(results)[2:end]]
+    
+    # Add data to profit plots
+    plot!(profit_plot, firm1_percentages,
+        [r.avg_profit1 for r in results],
+        ribbon=([r.avg_profit1 - r.min_profit1 for r in results],
+                [r.max_profit1 - r.avg_profit1 for r in results]),
+        fillalpha=0.2,
+        label=(sequential ? "Firm 1" : ""),
+        color=:blue,
+        lw=2)
+    plot!(profit_plot, firm1_percentages,
+        [r.avg_profit2 for r in results],
+        ribbon=([r.avg_profit2 - r.min_profit2 for r in results],
+                [r.max_profit2 - r.avg_profit2 for r in results]),
+        fillalpha=0.2,
+        label=(sequential ? "Firm 2" : ""),
+        color=:red,
+        lw=2)
+        
+    push!(plots, profit_plot)
+end
+
+# Then create both pay plots
+for (idx, sequential) in enumerate([true, false])
+    pay_plot = plot(
+        ylabel=(sequential ? "Worker Pay (\$/hr)" : ""),
+        xlabel="Firm 1 Market Share (%)",  # Updated x-axis label
+        legend=false,
+        ylims=pay_range,
+        xlims=(0, 100),  # Set x-axis from 0% to 100%
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Collect and plot pay data
+    results = []
+    
+    for firm1_size in firm1_sizes
+        p = @set p.firm1_demand = firm1_size
+        p = @set p.firm2_demand = 4.0 - firm1_size
+        
+        push!(results, get_results(data, p, sequential=sequential))
+    end
+    # add the results to the plot in reverse order to make it symmetric
+    results = [results; reverse(results)[2:end]]
+    
+    # Add data to pay plots
+    plot!(pay_plot, firm1_percentages,
+        [r.avg_pay1 for r in results],
+        ribbon=([r.avg_pay1 - r.min_pay1 for r in results],
+                [r.max_pay1 - r.avg_pay1 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:blue,
+        lw=2)
+    plot!(pay_plot, firm1_percentages,
+        [r.avg_pay2 for r in results],
+        ribbon=([r.avg_pay2 - r.min_pay2 for r in results],
+                [r.max_pay2 - r.avg_pay2 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:red,
+        lw=2)
+        
+    push!(plots, pay_plot)
+end
+
+# Combine plots in a 2x2 grid
+p = plot(plots..., 
+    layout=(2,2), 
+    size=(1200,600))
+
+display(p)
+savefig(p, "figures/order_of_events.pdf")
+
+```
+
+## Impact of competition
+
+```julia
+data = load_object("results_cap5_32seeds.jld2")
+# First find the global min/max for profits and pay to ensure consistent y-axes
+profit_max = -Inf
+pay_max = -Inf
+
+p = base_p
+total_demand = 4.0
+fractions_dedicated = 0.0:0.1:1.0
+fractions_dedicated_firm1 = [0.0, 0.25, 0.5]
+
+# Set default font sizes
+default_font = 18  # Increased from default
+title_font = 18    # Increased from default
+
+for fraction_dedicated in fractions_dedicated, fraction_dedicated_firm1 in fractions_dedicated_firm1
+    p = @set p.firm1_demand = total_demand * fraction_dedicated * fraction_dedicated_firm1
+    p = @set p.firm2_demand = total_demand * fraction_dedicated * (1 - fraction_dedicated_firm1)
+    p = @set p.firm12_demand = total_demand * (1 - fraction_dedicated)
+    
+    results = get_results(data, p)
+    
+    profit_max = max(profit_max, results.max_profit1, results.max_profit2)
+    pay_max = max(pay_max, isnan(results.max_pay1) ? -Inf : results.max_pay1, isnan(results.max_pay2) ? -Inf : results.max_pay2)
+end
+
+# Add some padding to the ranges
+profit_range = [0.0, profit_max + 0.05*(profit_max)]
+pay_range = [0.0, pay_max + 0.05*(pay_max-40.0)]
+
+
+# Create plots
+profit_plots = []
+pay_plots = []
+
+
+# Convert to percentages
+fractions_dedicated_pct = 100 * collect(fractions_dedicated)
+
+for fraction_dedicated_firm1 in fractions_dedicated_firm1
+    # Profit plot
+    profit_plot = plot(
+        title="Dedicated Demand Share: $(Int(100*fraction_dedicated_firm1))%/$(Int(100*(1-fraction_dedicated_firm1)))%",
+        ylabel=(fraction_dedicated_firm1 == 0.0 ? "Profit (\$/hr)" : ""),
+        xlabel="",  # Remove x-label from profit plots
+        legend=(fraction_dedicated_firm1 == 0.0 ? :top : false),
+        ylims=profit_range,
+            xlims=(0, 100),
+            # Add font sizes
+            titlefont=title_font,
+            guidefont=default_font,
+            tickfont=default_font,
+            legendfont=default_font
+    )
+    
+    # Collect profit data
+    results = []
+    for fraction_dedicated in fractions_dedicated
+        p = @set p.firm1_demand = total_demand * fraction_dedicated * fraction_dedicated_firm1
+        p = @set p.firm2_demand = total_demand * fraction_dedicated * (1 - fraction_dedicated_firm1)
+        p = @set p.firm12_demand = total_demand * (1 - fraction_dedicated)
+        
+        push!(results, get_results(data, p))
+    end
+    
+    plot!(profit_plot, fractions_dedicated_pct, 
+        [r.avg_profit1 for r in results],
+        ribbon=([r.avg_profit1 - r.min_profit1 for r in results],
+                [r.max_profit1 - r.avg_profit1 for r in results]),
+        fillalpha=0.2,
+        label="Firm 1",
+        color=:blue,
+        lw=2)
+    plot!(profit_plot, fractions_dedicated_pct, 
+        [r.avg_profit2 for r in results],
+        ribbon=([r.avg_profit2 - r.min_profit2 for r in results],
+                [r.max_profit2 - r.avg_profit2 for r in results]),
+        fillalpha=0.2,
+        label="Firm 2", 
+        color=:red,
+        lw=2)
+    
+    push!(profit_plots, profit_plot)
+    
+    # Pay plot
+    pay_plot = plot(
+        title="",  # Remove title from pay plots
+        ylabel=(fraction_dedicated_firm1 == 0.0 ? "Worker Pay" : ""),
+        xlabel="Dedicated Demand (%)",
+        legend=false,
+        ylims=pay_range,
+        xlims=(0, 100),
+        # Add font sizes
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Collect pay data
+    results = []
+    for fraction_dedicated in fractions_dedicated
+        p = @set p.firm1_demand = total_demand * fraction_dedicated * fraction_dedicated_firm1
+        p = @set p.firm2_demand = total_demand * fraction_dedicated * (1 - fraction_dedicated_firm1)
+        p = @set p.firm12_demand = total_demand * (1 - fraction_dedicated)
+        
+        push!(results, get_results(data, p))
+    end
+    
+
+    plot!(pay_plot, fractions_dedicated_pct,
+        [r.avg_pay1 for r in results],
+        ribbon=([r.avg_pay1 - r.min_pay1 for r in results],
+                [r.max_pay1 - r.avg_pay1 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:blue,
+        lw=2)
+    plot!(pay_plot, fractions_dedicated_pct,
+        [r.avg_pay2 for r in results],
+        ribbon=([r.avg_pay2 - r.min_pay2 for r in results],
+                [r.max_pay2 - r.avg_pay2 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:red,
+        lw=2)
+    
+    push!(pay_plots, pay_plot)
+end
+
+# Combine plots in a 2x3 grid with profits on top and pay on bottom
+p = plot(profit_plots..., pay_plots..., 
+    layout=(2,3), 
+    size=(1200,600),
+    tex_output_standalone=true)
+display(p)
+# Save with padding
+savefig(p, "figures/dedicated_demand.pdf")
+
+```
+
+## Impact of quality
+Vary the sensitivity of the demand to the service cost, in competition vs non-competition.
+
+```julia
+data = load_object("results_cap5_32seeds.jld2")
+# First find the global max for profits and pay
+profit_max = -Inf
+pay_max = -Inf
+
+p = base_p
+total_demand = 4.0
+no_service_costs = 0.0:1.0:10.0
+firm1_demand_ratios = [1/4, 1/2]
+competitions = [true, false]
+
+# Find global max across all scenarios
+for no_service_cost in no_service_costs, firm1_demand_ratio in firm1_demand_ratios, competition in competitions
+    p = @set p.no_service_cost = no_service_cost
+    if competition
+        p = @set p.firm1_demand = 0.0
+        p = @set p.firm2_demand = 0.0
+        p = @set p.firm12_demand = total_demand
+    else
+        p = @set p.firm1_demand = total_demand * firm1_demand_ratio
+        p = @set p.firm2_demand = total_demand * (1 - firm1_demand_ratio)
+        p = @set p.firm12_demand = 0.0
+    end
+    
+    results = get_results(data, p)
+    profit_max = max(profit_max, results.max_profit1, results.max_profit2)
+    pay_max = max(pay_max, 
+        isnan(results.max_pay1) ? -Inf : results.max_pay1, 
+        isnan(results.max_pay2) ? -Inf : results.max_pay2)
+end
+
+# Add padding to ranges
+profit_range = [0.0, profit_max * 1.05]
+pay_range = [0.0, pay_max * 1.05]
+
+# Create separate arrays for profit and pay plots
+profit_plots = []
+pay_plots = []
+
+# Set default font sizes
+default_font = 18
+title_font = 18
+
+# Create plots for each scenario
+scenarios = [
+    ("Competition", true, nothing),
+    ("No competition, Demand 50%/50%", false, 1/2),
+    ("No competition, Demand 25%/75%", false, 1/4)
+]
+
+for (idx, (title, is_competition, firm1_ratio)) in enumerate(scenarios)
+    # Profit plot
+    profit_plot = plot(
+        title=title,
+        ylabel=(idx == 1 ? "Profit (\$/hr)" : ""),
+        xlabel="",
+        legend=(idx == 1 ? :topright : false),
+        ylims=profit_range,
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Collect profit data
+    results = []
+    for no_service_cost in no_service_costs
+        p = @set p.no_service_cost = no_service_cost
+        if is_competition
+            p = @set p.firm1_demand = 0.0
+            p = @set p.firm2_demand = 0.0
+            p = @set p.firm12_demand = total_demand
+        else
+            p = @set p.firm1_demand = total_demand * firm1_ratio
+            p = @set p.firm2_demand = total_demand * (1 - firm1_ratio)
+            p = @set p.firm12_demand = 0.0
+        end
+        push!(results, get_results(data, p))
+    end
+    
+    # Plot profit data
+    plot!(profit_plot, no_service_costs,
+        [r.avg_profit1 for r in results],
+        ribbon=([r.avg_profit1 - r.min_profit1 for r in results],
+                [r.max_profit1 - r.avg_profit1 for r in results]),
+        fillalpha=0.2,
+        label=(idx == 1 ? "Firm 1" : ""),
+        color=:blue,
+        lw=2)
+    plot!(profit_plot, no_service_costs,
+        [r.avg_profit2 for r in results],
+        ribbon=([r.avg_profit2 - r.min_profit2 for r in results],
+                [r.max_profit2 - r.avg_profit2 for r in results]),
+        fillalpha=0.2,
+        label=(idx == 1 ? "Firm 2" : ""),
+        color=:red,
+        lw=2)
+    
+    push!(profit_plots, profit_plot)
+    
+    # Pay plot
+    pay_plot = plot(
+        ylabel=(idx == 1 ? "Worker Pay (\$/hr)" : ""),
+        xlabel="Cost of not being served (\$)",
+        legend=false,
+        ylims=pay_range,
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Plot pay data
+    plot!(pay_plot, no_service_costs,
+        [r.avg_pay1 for r in results],
+        ribbon=([r.avg_pay1 - r.min_pay1 for r in results],
+                [r.max_pay1 - r.avg_pay1 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:blue,
+        lw=2)
+    plot!(pay_plot, no_service_costs,
+        [r.avg_pay2 for r in results],
+        ribbon=([r.avg_pay2 - r.min_pay2 for r in results],
+                [r.max_pay2 - r.avg_pay2 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:red,
+        lw=2)
+    
+    push!(pay_plots, pay_plot)
+end
+
+# Combine plots in a 2x3 grid
+p = plot(profit_plots..., pay_plots..., 
+    layout=(2,3), 
+    size=(1200,600),
+    tex_output_standalone=true)
+display(p)
+savefig(p, "figures/quality.pdf")
+```
+
+# Impact of supply sensitivity
+
+```julia
+# Impact of supply sensitivity
+data = load_object("results_cap5_32seeds.jld2")
+# First find the global min/max for profits and pay
+profit_max = -Inf
+pay_max = -Inf
+
+p = base_p
+supply_sensitivities = 10 .^ range(-1, 1, length=11)
+total_demand = 4.0
+firm_demand_ratios = [1/4, 1/2]
+
+# Find global max/min
+for supply_sensitivity in supply_sensitivities, firm_demand_ratio in firm_demand_ratios
+    p = @set p.supply_sensitivity = supply_sensitivity
+    p = @set p.firm1_demand = total_demand * firm_demand_ratio
+    p = @set p.firm2_demand = total_demand * (1 - firm_demand_ratio)
+    
+    results = get_results(data, p)
+    profit_max = max(profit_max, results.max_profit1, results.max_profit2)
+    pay_max = max(pay_max, 
+        isnan(results.max_pay1) ? -Inf : results.max_pay1, 
+        isnan(results.max_pay2) ? -Inf : results.max_pay2)
+end
+
+# Add padding to ranges
+profit_range = [0.0, profit_max * 1.05]
+pay_range = [0.0, pay_max * 1.05]
+
+# Set default font sizes
+default_font = 18
+title_font = 18
+
+# First create both profit plots
+profit_plots = []
+for (idx, firm_demand_ratio) in enumerate(firm_demand_ratios)
+    profit_plot = plot(
+        title="Demand $(Int(100*firm_demand_ratio))%/$(Int(100*(1-firm_demand_ratio)))%",
+        ylabel=(idx == 1 ? "Profit (\$/hr)" : ""),
+        xlabel="",
+        legend=(idx == 1 ? :topright : false),
+        ylims=profit_range,
+        xscale=:log10,
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Collect and plot profit data
+    results = []
+    for supply_sensitivity in supply_sensitivities
+        p = @set p.supply_sensitivity = supply_sensitivity
+        p = @set p.firm1_demand = total_demand * firm_demand_ratio
+        p = @set p.firm2_demand = total_demand * (1 - firm_demand_ratio)
+        push!(results, get_results(data, p))
+    end
+    
+    plot!(profit_plot, supply_sensitivities,
+        [r.avg_profit1 for r in results],
+        ribbon=([r.avg_profit1 - r.min_profit1 for r in results],
+                [r.max_profit1 - r.avg_profit1 for r in results]),
+        fillalpha=0.2,
+        label=(idx == 1 ? "Firm 1" : ""),
+        color=:blue,
+        lw=2)
+    plot!(profit_plot, supply_sensitivities,
+        [r.avg_profit2 for r in results],
+        ribbon=([r.avg_profit2 - r.min_profit2 for r in results],
+                [r.max_profit2 - r.avg_profit2 for r in results]),
+        fillalpha=0.2,
+        label=(idx == 1 ? "Firm 2" : ""),
+        color=:red,
+        lw=2)
+    
+    push!(profit_plots, profit_plot)
+end
+
+# Then create both pay plots
+pay_plots = []
+for (idx, firm_demand_ratio) in enumerate(firm_demand_ratios)
+    pay_plot = plot(
+        ylabel=(idx == 1 ? "Worker Pay (\$/hr)" : ""),
+        xlabel="Supply Sensitivity",
+        legend=false,
+        ylims=pay_range,
+        xscale=:log10,
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Collect and plot pay data
+    results = []
+    for supply_sensitivity in supply_sensitivities
+        p = @set p.supply_sensitivity = supply_sensitivity
+        p = @set p.firm1_demand = total_demand * firm_demand_ratio
+        p = @set p.firm2_demand = total_demand * (1 - firm_demand_ratio)
+        push!(results, get_results(data, p))
+    end
+    
+    plot!(pay_plot, supply_sensitivities,
+        [r.avg_pay1 for r in results],
+        ribbon=([r.avg_pay1 - r.min_pay1 for r in results],
+                [r.max_pay1 - r.avg_pay1 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:blue,
+        lw=2)
+    plot!(pay_plot, supply_sensitivities,
+        [r.avg_pay2 for r in results],
+        ribbon=([r.avg_pay2 - r.min_pay2 for r in results],
+                [r.max_pay2 - r.avg_pay2 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:red,
+        lw=2)
+    
+    push!(pay_plots, pay_plot)
+end
+
+# Combine plots in a 2x2 grid with profits on top and pay on bottom
+p = plot(profit_plots..., pay_plots..., 
+    layout=(2,2), 
+    size=(1200,600),
+    tex_output_standalone=true)
+display(p)
+savefig(p, "figures/supply_sensitivity.pdf")
+```
+
+# Impact of private labor pools
+
+```julia
+data = load_object("results_cap5_32seeds.jld2")
+# First find the global min/max for profits and pay to ensure consistent y-axes
+profit_max = -Inf
+pay_max = -Inf
+
+p = base_p
+total_supply = 4.0
+fractions_dedicated = 0.0:0.1:1.0
+fractions_dedicated_firm1 = [0.0, 0.25, 0.5]
+
+# Set default font sizes
+default_font = 18
+title_font = 18
+
+for fraction_dedicated in fractions_dedicated, fraction_dedicated_firm1 in fractions_dedicated_firm1
+    p = @set p.firm1_supply = total_supply * fraction_dedicated * fraction_dedicated_firm1
+    p = @set p.firm2_supply = total_supply * fraction_dedicated * (1 - fraction_dedicated_firm1)
+    p = @set p.firm12_supply = total_supply * (1 - fraction_dedicated)
+    
+    results = get_results(data, p)
+    
+    profit_max = max(profit_max, results.max_profit1, results.max_profit2)
+    pay_max = max(pay_max, isnan(results.max_pay1) ? -Inf : results.max_pay1, isnan(results.max_pay2) ? -Inf : results.max_pay2)
+end
+
+# Add some padding to the ranges
+profit_range = [0.0, profit_max * 1.05]
+pay_range = [0.0, pay_max * 1.05]
+
+# Create plots
+profit_plots = []
+pay_plots = []
+
+# Convert to percentages
+fractions_dedicated_pct = 100 * collect(fractions_dedicated)
+
+for fraction_dedicated_firm1 in fractions_dedicated_firm1
+    # Profit plot
+    profit_plot = plot(
+        title="Dedicated Supply Share: $(Int(100*fraction_dedicated_firm1))% / $(Int(100*(1-fraction_dedicated_firm1)))%",
+        ylabel=(fraction_dedicated_firm1 == 0.0 ? "Profit (\$/hr)" : ""),
+        xlabel="",
+        legend=(fraction_dedicated_firm1 == 0.0 ? :topright : false),
+        ylims=profit_range,
+        xlims=(0, 100),
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Collect profit data
+    results = []
+    for fraction_dedicated in fractions_dedicated
+        p = @set p.firm1_supply = total_supply * fraction_dedicated * fraction_dedicated_firm1
+        p = @set p.firm2_supply = total_supply * fraction_dedicated * (1 - fraction_dedicated_firm1)
+        p = @set p.firm12_supply = total_supply * (1 - fraction_dedicated)
+        
+        push!(results, get_results(data, p))
+    end
+    
+    plot!(profit_plot, fractions_dedicated_pct, 
+        [r.avg_profit1 for r in results],
+        ribbon=([r.avg_profit1 - r.min_profit1 for r in results],
+                [r.max_profit1 - r.avg_profit1 for r in results]),
+        fillalpha=0.2,
+        label="Firm 1",
+        color=:blue,
+        lw=2)
+    plot!(profit_plot, fractions_dedicated_pct, 
+        [r.avg_profit2 for r in results],
+        ribbon=([r.avg_profit2 - r.min_profit2 for r in results],
+                [r.max_profit2 - r.avg_profit2 for r in results]),
+        fillalpha=0.2,
+        label="Firm 2", 
+        color=:red,
+        lw=2)
+    
+    push!(profit_plots, profit_plot)
+    
+    # Pay plot
+    pay_plot = plot(
+        ylabel=(fraction_dedicated_firm1 == 0.0 ? "Worker Pay (\$/hr)" : ""),
+        xlabel="Dedicated Supply (%)",
+        legend=false,
+        ylims=pay_range,
+        xlims=(0, 100),
+        titlefont=title_font,
+        guidefont=default_font,
+        tickfont=default_font,
+        legendfont=default_font
+    )
+    
+    # Collect pay data
+    results = []
+    for fraction_dedicated in fractions_dedicated
+        p = @set p.firm1_supply = total_supply * fraction_dedicated * fraction_dedicated_firm1
+        p = @set p.firm2_supply = total_supply * fraction_dedicated * (1 - fraction_dedicated_firm1)
+        p = @set p.firm12_supply = total_supply * (1 - fraction_dedicated)
+        
+        push!(results, get_results(data, p))
+    end
+    
+    plot!(pay_plot, fractions_dedicated_pct,
+        [r.avg_pay1 for r in results],
+        ribbon=([r.avg_pay1 - r.min_pay1 for r in results],
+                [r.max_pay1 - r.avg_pay1 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:blue,
+        lw=2)
+    plot!(pay_plot, fractions_dedicated_pct,
+        [r.avg_pay2 for r in results],
+        ribbon=([r.avg_pay2 - r.min_pay2 for r in results],
+                [r.max_pay2 - r.avg_pay2 for r in results]),
+        fillalpha=0.2,
+        label="",
+        color=:red,
+        lw=2)
+    
+    push!(pay_plots, pay_plot)
+end
+
+# Combine plots in a 2x3 grid with profits on top and pay on bottom
+p = plot(profit_plots..., pay_plots..., 
+    layout=(2,3), 
+    size=(1200,600),
+    tex_output_standalone=true)
+display(p)
+savefig(p, "figures/dedicated_supply.pdf")
+
+``` 
