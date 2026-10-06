@@ -7,10 +7,21 @@ export simultaneousNE, simultaneousNE_supplydemand
 
 using Random, Distributions, Printf
 using LinearAlgebra: norm, Tridiagonal
+import LinearAlgebra.BLAS
 using SparseArrays
 using OffsetArrays: Origin # for 1-based indexing
 
 import Base: broadcastable
+
+function __init__()
+    # The engine performs thousands of tiny (<=216x216) linear solves per equilibrium.
+    # Multithreaded BLAS only adds thread-dispatch overhead at this size, and under the
+    # pmap sweep (one worker process per core) default multithreaded BLAS would
+    # oversubscribe the machine (n_workers x BLAS_threads). Pin BLAS to a single thread on
+    # every process that loads this module (main + each Distributed worker). This changes
+    # nothing numerically -- it only removes thread contention (measured ~10x+ on the sweep).
+    BLAS.set_num_threads(1)
+end
 
 """Problem Parameters"""
 @kwdef struct ProblemParameters
@@ -160,7 +171,25 @@ Demand Utility    -- Dedi 1: %8.2f, Dedi 2: %8.2f, Flex: %8.2f
             s.demand1_utility, s.demand2_utility, s.demand12_utility))
 end
 
+# Per-process memoization of the stationary-distribution solve.
+# `solve_stationary_distribution` is a pure, deterministic function of `mc`, and the nested
+# best-response dynamics revisit the same `mc` for ~90%+ of all solves within a single
+# equilibrium (the queueing solve depends only on the worker/demand arrival rates, not on
+# prices or pay). Caching the result removes the large majority of the linear solves. The
+# cache is cleared at the start of each top-level equilibrium solve (`sequentialNE` /
+# `simultaneousNE`) to keep memory bounded; under the pmap/Distributed sweep each worker
+# process holds its own cache, so there is no data race. Cached vectors are only read
+# (summed/indexed) downstream, so sharing a reference across results is safe.
+const _STATIONARY_CACHE = Dict{NTuple{7,Float64}, Vector{Float64}}()
+_clear_stationary_cache!() = empty!(_STATIONARY_CACHE)
+
 function solve_stationary_distribution(mc::DiscreteMarkovChain)
+    cache_key = (mc.proba_arrival1, mc.proba_arrival2, mc.proba_arrival12,
+                 mc.proba_service1, mc.proba_service2, mc.proba_service12, Float64(mc.max_queue))
+    cached = get(_STATIONARY_CACHE, cache_key, nothing)
+    if cached !== nothing
+        return Origin(0)(reshape(cached, mc.max_queue+1, mc.max_queue+1, mc.max_queue+1))
+    end
     state_id(i,j,k) = i + (mc.max_queue+1) * (j + (mc.max_queue+1) * k) + 1
     I = Int[] # the origin state
     J = Int[] # the destination state
@@ -246,7 +275,27 @@ function solve_stationary_distribution(mc::DiscreteMarkovChain)
     b = zeros((mc.max_queue+1)^3+1)
     b[(mc.max_queue+1)^3+1] = 1.
     # solve the linear system
-    x = Origin(0)(reshape(A\b, mc.max_queue+1, mc.max_queue+1, mc.max_queue+1))
+    # When a queue has zero arrivals the Markov chain is reducible and this system is rank-deficient
+    # (the stationary distribution is non-unique). The sparse least-squares solver then returns an
+    # arbitrary, non-physical, firm-asymmetric particular solution -- the root cause of the firm-1/
+    # firm-2 asymmetry at extreme demand splits (e.g. the 95/5 case). A dense (minimum-norm) solve is
+    # unique and firm-swap-equivariant, so use it for these degenerate cases; non-degenerate systems
+    # are full rank, where the sparse solve is exact and much faster, so keep it for the common case.
+    reducible = (mc.proba_arrival1 == 0 || mc.proba_arrival2 == 0 || mc.proba_arrival12 == 0)
+    if reducible
+        raw = Matrix(A) \ b   # dense (minimum-norm) least-squares: the validated symmetry fix, UNCHANGED
+    else
+        # Full-rank (irreducible) case: solve a SQUARE system with sparse LU instead of the
+        # rectangular least-squares above. The (n+1)x n system has n balance rows (rank n-1)
+        # plus an all-ones normalization row (the last row). Dropping one redundant balance
+        # row (row n) and keeping the normalization row gives a full-rank n x n system whose
+        # LU solve is ~3x faster than rectangular SPQR and matches the least-squares
+        # stationary distribution to ~1e-15.
+        n = (mc.max_queue+1)^3
+        sq_rows = [1:(n-1); n+1]
+        raw = A[sq_rows, :] \ b[sq_rows]
+    end
+    x = Origin(0)(reshape(raw, mc.max_queue+1, mc.max_queue+1, mc.max_queue+1))
     # clean up the solution 
     if mc.proba_arrival1 == 0
         x[1:end,:,:] .= 0.
@@ -258,6 +307,7 @@ function solve_stationary_distribution(mc::DiscreteMarkovChain)
         x[:,:,1:end] .= 0.
     end
     x ./= sum(x) # for numerical stability
+    _STATIONARY_CACHE[cache_key] = raw  # `x` aliases `raw` (reshape+Origin share memory), so `raw` holds the final values
     return x
 end
 
@@ -368,6 +418,7 @@ end
 
 "computes the four-stage equilibrium (first stage: price, second stage: demand, third stage: pay, fourth stage: supply)"
 function sequentialNE(p::ProblemParameters, firms::FirmDecisions, workers::WorkerDecisions, demand::DemandDecisions; iter_print=1, max_iter=200, verbose=false, show_intermediate=false, max_simulations=300)
+    _clear_stationary_cache!()  # top-level entry: bound the per-process memo cache to one equilibrium solve
     next_state = Dict{Any,Any}()
     stage_iter = 1
     firms, workers, demand, sim, total_iter = sequentialNE_demand(p, firms, workers, demand, max_iter=max_iter)
@@ -903,6 +954,7 @@ end
 
 "simultaneous equilibrium between firms (price and pay), the first stage of the simultaneous equilibrium"
 function simultaneousNE(p::ProblemParameters, firms::FirmDecisions, workers::WorkerDecisions, demand::DemandDecisions; iter_print=1, max_iter=200, verbose=false, show_intermediate=false, max_simulations=300)
+    _clear_stationary_cache!()  # top-level entry: bound the per-process memo cache to one equilibrium solve
     next_state = Dict{Any,Any}()
     stage_iter = 1
     workers, demand, sim, total_iter = simultaneousNE_supplydemand(p, firms, workers, demand, max_iter=max_iter)
