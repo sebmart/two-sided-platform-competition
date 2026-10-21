@@ -6,3 +6,4 @@ Icon*
 results_order_of_events_allpoints_32seeds.jld2
 figure_regeneration/logs/
 figure_regeneration/results/units/
+figure_regeneration/diagnostics/logs/

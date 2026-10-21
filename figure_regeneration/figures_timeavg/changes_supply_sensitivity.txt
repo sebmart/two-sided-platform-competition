@@ -1,0 +1,25 @@
+== supply_sensitivity: largest absolute change (time average vs most favorable state) over the x grid, $ (pay) or $/hr (profit) ==
+  25/75          avg_pay1     max |change| =  0.846  at x = 0.158    (MFS  33.156 -> TA  34.003)   mean |change| = 0.233
+  25/75          avg_pay2     max |change| =  0.566  at x = 0.251    (MFS  63.156 -> TA  62.590)   mean |change| = 0.260
+  25/75          avg_profit1  max |change| =  0.376  at x = 6.31     (MFS  13.982 -> TA  13.606)   mean |change| = 0.182
+  25/75          avg_profit2  max |change| =  0.364  at x = 1.585    (MFS  20.299 -> TA  19.936)   mean |change| = 0.148
+  25/75          max_pay1     max |change| =  1.500  at x = 0.398    (MFS  46.000 -> TA  47.500)   mean |change| = 0.460
+  25/75          max_pay2     max |change| =  1.125  at x = 0.158    (MFS  56.000 -> TA  54.875)   mean |change| = 0.553
+  25/75          max_profit1  max |change| =  0.491  at x = 6.31     (MFS  14.603 -> TA  14.113)   mean |change| = 0.246
+  25/75          max_profit2  max |change| =  0.554  at x = 1.585    (MFS  20.794 -> TA  20.240)   mean |change| = 0.198
+  25/75          min_pay1     max |change| =  1.500  at x = 0.398    (MFS  39.750 -> TA  38.250)   mean |change| = 0.523
+  25/75          min_pay2     max |change| =  0.625  at x = 0.158    (MFS  53.000 -> TA  53.625)   mean |change| = 0.222
+  25/75          min_profit1  max |change| =  0.396  at x = 1.0      (MFS   9.745 -> TA   9.349)   mean |change| = 0.163
+  25/75          min_profit2  max |change| =  0.439  at x = 2.512    (MFS  19.409 -> TA  18.970)   mean |change| = 0.199
+  50/50          avg_pay1     max |change| =  0.391  at x = 0.1      (MFS  45.906 -> TA  46.297)   mean |change| = 0.146
+  50/50          avg_pay2     max |change| =  0.641  at x = 10.0     (MFS  65.094 -> TA  64.453)   mean |change| = 0.234
+  50/50          avg_profit1  max |change| =  0.292  at x = 3.981    (MFS  13.626 -> TA  13.335)   mean |change| = 0.158
+  50/50          avg_profit2  max |change| =  0.306  at x = 1.0      (MFS  12.416 -> TA  12.111)   mean |change| = 0.100
+  50/50          max_pay1     max |change| =  1.250  at x = 0.251    (MFS  57.250 -> TA  58.500)   mean |change| = 0.506
+  50/50          max_pay2     max |change| =  1.000  at x = 1.0      (MFS  65.000 -> TA  64.000)   mean |change| = 0.392
+  50/50          max_profit1  max |change| =  0.459  at x = 2.512    (MFS  14.703 -> TA  14.244)   mean |change| = 0.204
+  50/50          max_profit2  max |change| =  0.321  at x = 1.585    (MFS  14.516 -> TA  14.195)   mean |change| = 0.113
+  50/50          min_pay1     max |change| =  0.875  at x = 0.158    (MFS  52.000 -> TA  52.875)   mean |change| = 0.341
+  50/50          min_pay2     max |change| =  0.750  at x = 10.0     (MFS  64.750 -> TA  64.000)   mean |change| = 0.386
+  50/50          min_profit1  max |change| =  0.859  at x = 3.981    (MFS  13.299 -> TA  12.440)   mean |change| = 0.200
+  50/50          min_profit2  max |change| =  0.398  at x = 3.981    (MFS  13.128 -> TA  12.729)   mean |change| = 0.141

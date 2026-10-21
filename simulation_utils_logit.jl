@@ -571,12 +571,13 @@ function sequentialNE_demand(p::ProblemParameters, firms::FirmDecisions, workers
         theoretical_demand1 = p.firm1_demand * 1/(1+exp(-p.demand_sensitivity * utility1))
         theoretical_demand2 = p.firm2_demand * 1/(1+exp(-p.demand_sensitivity * utility2))
         max_utility = max(utility1, utility2, utility12) # we need to shift the utilities by the max utility to avoid numerical issues
+        outside = exp(-p.demand_sensitivity * max_utility) # the outside option (utility 0), shifted like the other three
         theoretical_demand12_1 = p.firm12_demand * exp(p.demand_sensitivity * (utility1-max_utility))/
-            (1+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
+            (outside+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
         theoretical_demand12_2 = p.firm12_demand * exp(p.demand_sensitivity * (utility2-max_utility))/
-            (1+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
+            (outside+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
         theoretical_demand12_12 = p.firm12_demand * exp(p.demand_sensitivity * (utility12-max_utility))/
-            (1+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
+            (outside+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
         
         if verbose && show_intermediate && (stage_iter % iter_print == 0)
             println("===Demand 1     rate choice: theoretical=$(@sprintf("%6.3f", theoretical_demand1)) actual=$(@sprintf("%6.3f", demand1*p.rate_step))")
@@ -1261,12 +1262,13 @@ function simultaneousNE_supplydemand(p::ProblemParameters, firms::FirmDecisions,
         theoretical_demand1 = p.firm1_demand * 1/(1+exp(-p.demand_sensitivity * utility1))
         theoretical_demand2 = p.firm2_demand * 1/(1+exp(-p.demand_sensitivity * utility2))
         max_utility = max(utility1, utility2, utility12) # we need to shift the utilities by the max utility to avoid numerical issues
+        outside = exp(-p.demand_sensitivity * max_utility) # the outside option (utility 0), shifted like the other three
         theoretical_demand12_1 = p.firm12_demand * exp(p.demand_sensitivity * (utility1-max_utility))/
-            (1+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
+            (outside+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
         theoretical_demand12_2 = p.firm12_demand * exp(p.demand_sensitivity * (utility2-max_utility))/
-            (1+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
+            (outside+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
         theoretical_demand12_12 = p.firm12_demand * exp(p.demand_sensitivity * (utility12-max_utility))/
-            (1+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
+            (outside+exp(p.demand_sensitivity * (utility1-max_utility)) + exp(p.demand_sensitivity * (utility2-max_utility)) + exp(p.demand_sensitivity * (utility12-max_utility)))
 
         if verbose && show_intermediate && (stage_iter % iter_print == 0)
 
